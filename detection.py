@@ -1,8 +1,3 @@
-"""
-Complete AI Assistant with Wake Word Detection
-Features: Porcupine wake word, Groq LLM, system access, user memory
-"""
-
 import pvporcupine
 import pyaudio
 import struct
@@ -15,11 +10,15 @@ import psutil
 from groq import Groq
 import speech_recognition as sr
 import pyttsx3
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import threading
 import queue
 import warnings
 import sys
+import webbrowser
+import subprocess
+import shutil
+import urllib.parse
 
 # Suppress ALSA warnings
 warnings.filterwarnings('ignore')
@@ -85,6 +84,328 @@ def test_microphone(device_index=None):
         print(f"✗ Error: {e}")
         return False
 
+class BrowserDetector:
+    """Detects installed browsers across platforms"""
+    
+    def __init__(self):
+        self.system = platform.system().lower()
+        self.installed_browsers = self._detect_browsers()
+    
+    def _detect_browsers(self) -> Dict[str, Dict]:
+        """Detect all installed browsers with their paths and commands"""
+        browsers = {}
+        
+        if self.system == "windows":
+            browsers = self._detect_windows_browsers()
+        elif self.system == "darwin":
+            browsers = self._detect_mac_browsers()
+        else:
+            browsers = self._detect_linux_browsers()
+        
+        return browsers
+    
+    def _detect_windows_browsers(self) -> Dict[str, Dict]:
+        """Detect browsers on Windows"""
+        browsers = {}
+        
+        browser_paths = {
+            "chrome": [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            ],
+            "firefox": [
+                r"C:\Program Files\Mozilla Firefox\firefox.exe",
+                r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+            ],
+            "edge": [
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            ],
+            "brave": [
+                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ],
+            "opera": [
+                os.path.expandvars(r"%LOCALAPPDATA%\Programs\Opera\opera.exe"),
+                r"C:\Program Files\Opera\opera.exe",
+            ],
+            "vivaldi": [
+                os.path.expandvars(r"%LOCALAPPDATA%\Vivaldi\Application\vivaldi.exe"),
+            ],
+        }
+        
+        for browser_name, paths in browser_paths.items():
+            for path in paths:
+                if os.path.exists(path):
+                    browsers[browser_name] = {
+                        "path": path,
+                        "command": path,
+                        "name": browser_name.title()
+                    }
+                    break
+        
+        return browsers
+    
+    def _detect_mac_browsers(self) -> Dict[str, Dict]:
+        """Detect browsers on macOS"""
+        browsers = {}
+        
+        browser_apps = {
+            "chrome": "Google Chrome",
+            "firefox": "Firefox",
+            "safari": "Safari",
+            "brave": "Brave Browser",
+            "opera": "Opera",
+            "edge": "Microsoft Edge",
+        }
+        
+        for key, app_name in browser_apps.items():
+            app_path = f"/Applications/{app_name}.app"
+            if os.path.exists(app_path):
+                browsers[key] = {
+                    "path": app_path,
+                    "command": app_name,
+                    "name": app_name
+                }
+        
+        return browsers
+    
+    def _detect_linux_browsers(self) -> Dict[str, Dict]:
+        """Detect browsers on Linux"""
+        browsers = {}
+        
+        browser_commands = {
+            "chrome": ["google-chrome", "google-chrome-stable", "chrome"],
+            "firefox": ["firefox"],
+            "brave": ["brave-browser", "brave"],
+            "opera": ["opera"],
+            "chromium": ["chromium", "chromium-browser"],
+            "edge": ["microsoft-edge"],
+            "vivaldi": ["vivaldi"],
+        }
+        
+        for key, commands in browser_commands.items():
+            for cmd in commands:
+                if shutil.which(cmd):
+                    browsers[key] = {
+                        "path": shutil.which(cmd),
+                        "command": cmd,
+                        "name": key.title()
+                    }
+                    break
+        
+        return browsers
+    
+    def get_browser(self, browser_name: str) -> Optional[Dict]:
+        """Get browser info by name (case insensitive)"""
+        name_lower = browser_name.lower()
+        
+        # Direct match
+        if name_lower in self.installed_browsers:
+            return self.installed_browsers[name_lower]
+        
+        # Fuzzy match
+        for key, info in self.installed_browsers.items():
+            if name_lower in key or key in name_lower:
+                return info
+        
+        return None
+    
+    def get_default_browser(self) -> Optional[Dict]:
+        """Get the default system browser"""
+        if self.installed_browsers:
+            return list(self.installed_browsers.values())[0]
+        return None
+    
+    def list_browsers(self) -> List[str]:
+        """Get list of installed browser names"""
+        return [info["name"] for info in self.installed_browsers.values()]
+    
+    def open_browser(self, browser_name: Optional[str] = None, url: str = "about:blank") -> Tuple[bool, str]:
+        """
+        Open a browser with optional URL
+        Returns: (success: bool, message: str)
+        """
+        if not browser_name or browser_name.lower() in ["default", "browser"]:
+            browser_info = self.get_default_browser()
+            if not browser_info:
+                available = self.list_browsers()
+                if available:
+                    msg = f"No default browser set, but these are installed: {', '.join(available)}"
+                else:
+                    msg = "No browsers found on this system"
+                return False, msg
+            browser_name = list(self.installed_browsers.keys())[0]
+        
+        browser_info = self.get_browser(browser_name)
+        
+        if not browser_info:
+            available = self.list_browsers()
+            if available:
+                msg = f"{browser_name} is not installed. Available browsers: {', '.join(available)}"
+            else:
+                msg = f"{browser_name} is not installed and no other browsers were found"
+            return False, msg
+        
+        try:
+            if self.system == "windows":
+                if url and url != "about:blank":
+                    subprocess.Popen([browser_info["path"], url])
+                else:
+                    os.startfile(browser_info["path"])
+                return True, f"Opened {browser_info['name']}"
+            
+            elif self.system == "darwin":
+                cmd = ["open", "-a", browser_info["command"]]
+                if url and url != "about:blank":
+                    cmd.append(url)
+                subprocess.Popen(cmd)
+                return True, f"Opened {browser_info['name']}"
+            
+            else:  # Linux
+                cmd = [browser_info["command"]]
+                if url and url != "about:blank":
+                    cmd.append(url)
+                subprocess.Popen(cmd)
+                return True, f"Opened {browser_info['name']}"
+        
+        except Exception as e:
+            return False, f"Failed to open {browser_info['name']}: {str(e)}"
+
+class YouTubeHandler:
+    """Handles YouTube search and autoplay"""
+    
+    @staticmethod
+    def search_and_play(query: str, browser_detector: BrowserDetector) -> Tuple[bool, str]:
+        """
+        Search YouTube and play the first result
+        Returns: (success: bool, message: str)
+        """
+        search_query = urllib.parse.quote(query)
+        play_url = f"https://www.youtube.com/results?search_query={search_query}"
+        
+        success, msg = browser_detector.open_browser(url=play_url)
+        
+        if success:
+            return True, f"Playing '{query}' on YouTube"
+        else:
+            try:
+                webbrowser.open(play_url)
+                return True, f"Playing '{query}' on YouTube"
+            except Exception as e:
+                return False, f"Failed to open YouTube: {str(e)}"
+
+class MediaController:
+    """Manages media playback and application launching"""
+    
+    def __init__(self):
+        self.browser_detector = BrowserDetector()
+        self.youtube_handler = YouTubeHandler()
+        detected = self.browser_detector.list_browsers()
+        if detected:
+            print(f"✓ Detected browsers: {', '.join(detected)}")
+    
+    def open_app(self, app_name: str) -> Tuple[bool, str]:
+        """
+        Open an application
+        Returns: (success: bool, message: str)
+        """
+        if not app_name:
+            return False, "No app name provided"
+        
+        name = app_name.strip().lower()
+        system = platform.system().lower()
+        
+        # Handle browser requests
+        if name in ["browser", "default browser", "web browser"]:
+            return self.browser_detector.open_browser()
+        
+        # Check if it's a specific browser
+        browser_names = ["chrome", "firefox", "safari", "edge", "brave", "opera", "vivaldi", "chromium"]
+        if any(bn in name for bn in browser_names):
+            for bn in browser_names:
+                if bn in name:
+                    return self.browser_detector.open_browser(bn)
+        
+        # Common app aliases
+        alias_map = {
+            "spotify": ["spotify", "Spotify"],
+            "vlc": ["vlc", "VLC"],
+            "calculator": ["calc", "calculator", "gnome-calculator"],
+            "notepad": ["notepad"],
+            "code": ["code", "Visual Studio Code"],
+            "youtube": ["youtube"],
+        }
+        
+        # Special case: YouTube
+        if "youtube" in name:
+            return self.browser_detector.open_browser(url="https://www.youtube.com")
+        
+        # Try to launch app
+        candidates = alias_map.get(name, [app_name])
+        
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                try:
+                    if system == "windows":
+                        os.startfile(candidate)
+                        return True, f"Opened {app_name}"
+                    else:
+                        subprocess.Popen([candidate])
+                        return True, f"Opened {app_name}"
+                except Exception:
+                    continue
+            
+            if shutil.which(candidate):
+                try:
+                    subprocess.Popen([candidate])
+                    return True, f"Opened {app_name}"
+                except Exception:
+                    continue
+            
+            if system == "windows":
+                try:
+                    result = ctypes.windll.shell32.ShellExecuteW(None, "open", candidate, None, None, 1)
+                    if int(result) > 32:
+                        return True, f"Opened {app_name}"
+                except Exception:
+                    pass
+            elif system == "darwin":
+                try:
+                    subprocess.Popen(["open", "-a", candidate])
+                    return True, f"Opened {app_name}"
+                except Exception:
+                    pass
+        
+        return False, f"{app_name} is not installed on this system"
+    
+    def play_media(self, query: str, service: str = "youtube") -> Tuple[bool, str]:
+        """
+        Play media content
+        Returns: (success: bool, message: str)
+        """
+        if service.lower() in ["youtube", "yt"]:
+            return self.youtube_handler.search_and_play(query, self.browser_detector)
+        elif service.lower() == "spotify":
+            uri = f"spotify:search:{urllib.parse.quote(query)}"
+            success, msg = self.open_app("spotify")
+            if success:
+                try:
+                    if platform.system().lower() == "windows":
+                        os.startfile(uri)
+                    else:
+                        subprocess.Popen(["xdg-open", uri])
+                    return True, f"Playing '{query}' on Spotify"
+                except:
+                    pass
+            
+            url = f"https://open.spotify.com/search/{urllib.parse.quote(query)}"
+            return self.browser_detector.open_browser(url=url)
+        
+        return False, f"Service {service} not supported"
+
 
 class UserMemory:
     """Manages user information and conversation history"""
@@ -122,7 +443,6 @@ class UserMemory:
             "user": user_msg,
             "assistant": assistant_msg
         })
-        # Keep only last 20 conversations
         self.data["conversation_history"] = self.data["conversation_history"][-20:]
         self.data["last_interaction"] = datetime.now().isoformat()
         self.save_memory()
@@ -192,9 +512,10 @@ class VoiceAssistant:
         self.groq_client = Groq(api_key=groq_api_key)
         self.memory = UserMemory()
         self.system_info = SystemInfo()
+        self.media = MediaController()
         self.audio_device_index = audio_device_index
         
-        # Initialize Porcupine with custom or built-in keyword
+        # Initialize Porcupine
         if keyword_path and os.path.exists(keyword_path):
             print(f"✓ Using custom wake word model: {keyword_path}")
             self.porcupine = pvporcupine.create(
@@ -211,7 +532,6 @@ class VoiceAssistant:
         # Audio setup
         self.pa = pyaudio.PyAudio()
         
-        # Try to open audio stream with specified device
         try:
             self.audio_stream = self.pa.open(
                 rate=self.porcupine.sample_rate,
@@ -226,9 +546,9 @@ class VoiceAssistant:
             print(f"✗ Error opening audio stream: {e}")
             raise
         
-        # Speech recognition with device
+        # Speech recognition
         self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300  # Lower for better sensitivity
+        self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
         
         # Text-to-speech
@@ -278,7 +598,6 @@ class VoiceAssistant:
     
     def get_ai_response(self, user_input: str) -> str:
         """Get response from Groq LLM"""
-        # Build system prompt with context
         system_prompt = f"""You are a helpful AI assistant named Jarvis. You have access to system information and maintain memory of conversations with users.
 
 Current System Info:
@@ -331,23 +650,75 @@ Be conversational, friendly, and helpful. Keep responses concise (2-3 sentences 
     
     def process_command(self, command: str):
         """Process user command"""
-        # Check for system info requests
+        import re
+        
         command_lower = command.lower()
         
+        # BROWSER COMMANDS
+        if re.match(r"^open (the )?(default |web )?browser$", command_lower):
+            success, msg = self.media.browser_detector.open_browser()
+            self.speak(msg)
+            self.memory.add_conversation(command, msg)
+            return
+        
+        browser_match = re.match(r"^open (the )?(google )?(?P<browser>chrome|firefox|safari|edge|brave|opera|vivaldi|chromium)$", command_lower)
+        if browser_match:
+            browser_name = browser_match.group("browser")
+            success, msg = self.media.browser_detector.open_browser(browser_name)
+            self.speak(msg)
+            self.memory.add_conversation(command, msg)
+            return
+        
+        # GENERAL APP OPENING
+        app_match = re.match(r"^(open|start|launch) (the )?(?P<app>.+)$", command_lower)
+        if app_match:
+            app_name = app_match.group("app").strip()
+            success, msg = self.media.open_app(app_name)
+            self.speak(msg)
+            self.memory.add_conversation(command, msg)
+            return
+        
+        # PLAY COMMANDS
+        play_match = re.match(r"^play (the )?(?P<query>.+?)(?: (?:on|in) (?P<service>youtube|spotify|yt))?$", command_lower)
+        if play_match:
+            query = play_match.group("query").strip()
+            service = (play_match.group("service") or "youtube").strip()
+            
+            self.speak(f"Playing {query} on {service}")
+            success, msg = self.media.play_media(query, service)
+            
+            if not success:
+                self.speak(msg)
+            
+            self.memory.add_conversation(command, msg)
+            return
+        
+        # SYSTEM INFO
         if any(word in command_lower for word in ["time", "clock"]):
             response = f"It's currently {self.system_info.get_time()}"
-        elif any(word in command_lower for word in ["date", "day", "today"]):
+            self.speak(response)
+            self.memory.add_conversation(command, response)
+            return
+            
+        if any(word in command_lower for word in ["date", "day", "today"]):
             response = f"Today is {self.system_info.get_date()}"
-        elif any(word in command_lower for word in ["battery", "charge"]):
+            self.speak(response)
+            self.memory.add_conversation(command, response)
+            return
+            
+        if any(word in command_lower for word in ["battery", "charge"]):
             response = f"Your battery is at {self.system_info.get_battery()}"
-        elif "stop" in command_lower or "exit" in command_lower or "quit" in command_lower:
+            self.speak(response)
+            self.memory.add_conversation(command, response)
+            return
+            
+        if "stop" in command_lower or "exit" in command_lower or "quit" in command_lower:
             self.speak("Goodbye! Have a great day!")
             self.running = False
             return
-        else:
-            # Get AI response
-            response = self.get_ai_response(command)
         
+        # AI RESPONSE
+        response = self.get_ai_response(command)
         self.speak(response)
         self.memory.add_conversation(command, response)
     
@@ -370,25 +741,25 @@ Be conversational, friendly, and helpful. Keep responses concise (2-3 sentences 
         print("🎧 LISTENING FOR WAKE WORD")
         print("="*50)
         print("Say your wake word followed by your command")
-        print("Tip: Speak clearly and wait for the beep!")
-        print("Debug: Press Ctrl+C to exit")
+        print("Examples:")
+        print("  'Jarvis, open chrome'")
+        print("  'Jarvis, play despacito'")
+        print("  'Jarvis, what's the time?'")
+        print("Press Ctrl+C to exit")
         print("="*50 + "\n")
         
-        # Audio level monitoring
         frame_count = 0
         
         try:
             while self.running:
-                # Listen for wake word
                 pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
                 pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
                 
-                # Show audio activity every 50 frames (about every second)
                 frame_count += 1
                 if frame_count % 50 == 0:
                     audio_level = max(abs(min(pcm)), abs(max(pcm)))
-                    if audio_level > 500:  # Significant audio detected
-                        print(f"🎤 Audio detected (level: {audio_level}) - Say 'JARVIS' clearly!")
+                    if audio_level > 500:
+                        print(f"🎤 Audio detected (level: {audio_level}) - Say wake word!")
                 
                 keyword_index = self.porcupine.process(pcm)
                 
@@ -396,7 +767,6 @@ Be conversational, friendly, and helpful. Keep responses concise (2-3 sentences 
                     print("🔔 Wake word detected!")
                     self.speak("Yes?")
                     
-                    # Listen for command
                     command = self.listen_for_command()
                     if command:
                         self.process_command(command)
