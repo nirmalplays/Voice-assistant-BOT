@@ -14,459 +14,307 @@ import threading
 import queue
 import warnings
 import sys
-import webbrowser
 import subprocess
 import shutil
 import urllib.parse
 import re
 import glob
-import customtkinter as ctk
-from fuzzywuzzy import process, fuzz
+import math
+import audioop # For calculating volume RMS
+from fuzzywuzzy import process
 import pygame
+import random
+import time
+import requests
 
-# Suppress Warnings
+# Try imports
+try:
+    from youtubesearchpython import VideosSearch
+    YOUTUBE_ENABLED = True
+except: YOUTUBE_ENABLED = False
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except: SELENIUM_AVAILABLE = False
+
 warnings.filterwarnings('ignore')
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
-# Redirect ALSA error messages (Linux specific)
+# ALSA Error Suppress
 try:
     from ctypes import *
     ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
-    def py_error_handler(filename, line, function, err, fmt):
-        pass
+    def py_error_handler(filename, line, function, err, fmt): pass
     c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
     asound = cdll.LoadLibrary('libasound.so.2')
     asound.snd_lib_error_set_handler(c_error_handler)
-except:
-    pass
+except: pass
 
-# ------------------- UNIVERSAL APP LAUNCHER -------------------
+# ------------------- HELPERS -------------------
 
 class UniversalLauncher:
     def __init__(self):
         self.os_name = platform.system().lower()
-        self.linux_apps = {} 
-        if "linux" in self.os_name:
-            self._cache_linux_apps()
-
-    def _cache_linux_apps(self):
-        search_paths = [
-            "/usr/share/applications/",
-            "/usr/local/share/applications/",
-            os.path.expanduser("~/.local/share/applications/"),
-            "/var/lib/snapd/desktop/applications/",
-            "/snap/bin/"
-        ]
-        
-        desktop_files = []
-        for path in search_paths:
-            if os.path.exists(path):
-                if path.endswith("bin/"):
-                    for f in os.listdir(path):
-                        self.linux_apps[f.lower()] = os.path.join(path, f)
-                else:
-                    desktop_files.extend(glob.glob(os.path.join(path, "*.desktop")))
-
-        for file_path in desktop_files:
+        self.app_cache = {} 
+        self._build_cache()
+    def _build_cache(self):
+        if "windows" in self.os_name: self._scan_windows()
+        elif "linux" in self.os_name: self._scan_linux()
+    def _scan_windows(self):
+        paths = [os.path.join(os.environ.get("PROGRAMDATA","C:\\"), "Microsoft/Windows/Start Menu/Programs"),
+                 os.path.join(os.environ.get("APPDATA","C:\\"), "Microsoft/Windows/Start Menu/Programs")]
+        for p in paths:
+            if os.path.exists(p):
+                for r, _, fs in os.walk(p):
+                    for f in fs:
+                        if f.endswith(".lnk") or f.endswith(".url"):
+                            self.app_cache[f.split('.')[0].lower()] = os.path.join(r, f)
+    def _scan_linux(self):
+        paths = ["/usr/share/applications/", "/snap/bin/"]
+        for p in paths:
+            if os.path.exists(p):
+                for f in os.listdir(p):
+                    if f.endswith(".desktop"):
+                        try:
+                            with open(os.path.join(p, f), 'r') as file:
+                                c = file.read()
+                                n = re.search(r"^Name=(.*)", c, re.M)
+                                e = re.search(r"^Exec=(.*)", c, re.M)
+                                if n and e: self.app_cache[n.group(1).lower()] = e.group(1).split()[0]
+                        except: pass
+                    else: self.app_cache[f.lower()] = os.path.join(p, f)
+    def open(self, name):
+        match = process.extractOne(name.lower(), list(self.app_cache.keys()))
+        if match and match[1] > 60:
+            cmd = self.app_cache[match[0]]
             try:
-                with open(file_path, 'r', errors='ignore') as f:
-                    content = f.read()
-                    name_match = re.search(r"^Name=(.*)", content, re.MULTILINE)
-                    exec_match = re.search(r"^Exec=(.*)", content, re.MULTILINE)
-                    if name_match and exec_match:
-                        name = name_match.group(1).strip()
-                        cmd = exec_match.group(1).strip()
-                        cmd = re.sub(r" %[a-zA-Z]", "", cmd)
-                        self.linux_apps[name.lower()] = cmd
-                        if "visual studio code" in name.lower():
-                            self.linux_apps["vs code"] = cmd
-                            self.linux_apps["code"] = cmd
-            except: continue
+                if "windows" in self.os_name: os.startfile(cmd)
+                else: subprocess.Popen(cmd, shell=True, stderr=subprocess.DEVNULL)
+                return True, f"Opening {match[0]}"
+            except: return False, "Error launching."
+        return False, "App not found."
+    def open_url(self, url):
+        if "windows" in self.os_name: os.startfile(url)
+        elif "darwin" in self.os_name: subprocess.Popen(["open", url])
+        else: subprocess.Popen(["xdg-open", url], stderr=subprocess.DEVNULL)
 
-    def open_app(self, app_name: str) -> Tuple[bool, str]:
-        if "windows" in self.os_name: return self._open_windows(app_name)
-        elif "darwin" in self.os_name: return self._open_mac(app_name)
-        else: return self._open_linux(app_name)
-
-    def _open_windows(self, app_name: str):
-        try:
-            from AppOpener import open as app_open
-            app_open(app_name, match_closest=True, output=True)
-            return True, f"Opening {app_name}"
-        except: return False, "Windows AppOpener failed."
-
-    def _open_mac(self, app_name: str):
-        try:
-            subprocess.run(["open", "-a", app_name], check=True)
-            return True, f"Opening {app_name}"
-        except: return False, f"Could not find app '{app_name}'"
-
-    def _open_linux(self, app_name: str):
-        name = app_name.lower().strip()
-        cmd = self.linux_apps.get(name)
-        if not cmd:
-            best_match, score = process.extractOne(name, list(self.linux_apps.keys()))
-            if score > 60: cmd = self.linux_apps[best_match]
-            else: return False, f"Could not find '{app_name}' on Linux."
-
-        try:
-            env = os.environ.copy()
-            for key in ['LD_LIBRARY_PATH', 'PYTHONPATH', 'PYTHONHOME']:
-                if key in env: del env[key]
-            subprocess.Popen(cmd, shell=True, env=env, 
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True, f"Opening {name}"
-        except Exception as e: return False, f"Error launching {name}: {e}"
-
-
-# ------------------- MUSIC PLAYER (UPDATED) -------------------
-
-class LocalMusicPlayer:
+class MusicPlayer:
     def __init__(self):
-        user_home = os.path.expanduser("~")
-        self.search_dirs = [
-            os.path.join(user_home, "Music"),
-            os.path.join(user_home, "Downloads")
-        ]
-        try: pygame.mixer.init()
-        except: pass
-        self.current_song = None
+        self.data = {"songs":[], "playlists":{}}
+        self.queue = []
+        self.idx = 0
+        self.is_playing = False
+        pygame.mixer.init()
+        self._scan()
+    def _scan(self):
+        for root, _, files in os.walk(os.path.expanduser("~")):
+            if "/." in root: continue # skip hidden
+            for f in files:
+                if f.endswith(('.mp3','.wav','.flac')):
+                    self.data["songs"].append({"path": os.path.join(root,f), "name":f})
+    def play(self, query):
+        match = process.extractOne(query, [s["name"] for s in self.data["songs"]])
+        if match and match[1] > 60:
+            song = next(s for s in self.data["songs"] if s["name"] == match[0])
+            self.queue = [song["path"]]
+            self.idx = 0
+            self._start()
+            return f"Playing {song['name']}"
+        return False
+    def _start(self):
+        pygame.mixer.music.load(self.queue[self.idx])
+        pygame.mixer.music.play()
+        self.is_playing = True
+    def pause(self): pygame.mixer.music.pause(); return "Paused"
+    def resume(self): pygame.mixer.music.unpause(); return "Resumed"
+    def stop(self): pygame.mixer.music.stop(); return "Stopped"
+# ------------------- NEW WEB INTERFACE (SELENIUM) -------------------
 
-    def find_and_play(self, song_name):
-        supported_exts = ('.mp3', '.wav', '.ogg', '.m4a', '.flac')
-        files = []
-        
-        # If user provides full path, use it directly
-        if os.path.exists(song_name) and os.path.isfile(song_name):
-            files.append((song_name, os.path.basename(song_name)))
-        else:
-            # Scan folders
-            for search_path in self.search_dirs:
-                if os.path.exists(search_path):
-                    for root, _, filenames in os.walk(search_path):
-                        for filename in filenames:
-                            if filename.lower().endswith(supported_exts):
-                                files.append((os.path.join(root, filename), filename))
-
-        if not files: return False, "No music files found."
-
-        # Fuzzy match
-        filenames_only = [f[1] for f in files]
-        best_match, score = process.extractOne(os.path.basename(song_name), filenames_only)
-
-        if score < 50: return False, f"Couldn't find '{song_name}'."
-
-        full_path = next(f[0] for f in files if f[1] == best_match)
-        try:
-            if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
-            pygame.mixer.music.load(full_path)
-            pygame.mixer.music.play()
-            self.current_song = best_match
-            return True, f"Playing {best_match}"
-        except Exception as e: return False, f"Error: {e}"
-
-    # --- NEW CONTROLS ---
-    def pause(self):
-        if pygame.mixer.music.get_busy():
-            pygame.mixer.music.pause()
-            return "Music paused."
-        return "Nothing is playing."
-
-    def resume(self):
-        try:
-            pygame.mixer.music.unpause()
-            return "Resuming music."
-        except: return "Cannot resume."
-
-    def stop(self):
-        pygame.mixer.music.stop()
-        return "Music stopped."
-
-
-class MediaController:
+class WebInterface:
     def __init__(self):
-        self.launcher = UniversalLauncher()
-    
-    def open_app(self, app_name: str):
-        return self.launcher.open_app(app_name)
-        
-    def play_online(self, query: str, service: str = "youtube") -> Tuple[bool, str]:
-        if service.lower() in ["youtube", "yt"]:
-            url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-            webbrowser.open(url)
-            return True, f"Searching {query} on YouTube"
-        elif service.lower() == "spotify":
-            url = f"http://open.spotify.com/search/{urllib.parse.quote(query)}"
-            webbrowser.open(url)
-            return True, f"Searching {query} on Spotify"
-        return False, "Service not supported"
+        self.driver = None
+        self.running = False
+        if SELENIUM_AVAILABLE:
+            self._launch_ui()
 
-class UserMemory:
-    def __init__(self, memory_file: str = "user_memory.json"):
-        self.memory_file = memory_file
-        self.data = self.load_memory()
-    def load_memory(self):
-        if os.path.exists(self.memory_file):
+    def _launch_ui(self):
+        try:
+            options = webdriver.ChromeOptions()
+
+            # always load interface.html from the SAME FOLDER as detection.py
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            html_path = os.path.join(script_dir, "interface.html")
+
+            # show in app-style window
+            options.add_argument(f"--app=file:///{html_path.replace('\\', '/')}")
+            options.add_argument("--start-maximized")
+            options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+            print("loading UI from:", html_path)  # debug print in terminal
+
+            self.driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=options
+            )
+            self.running = True
+        except Exception as e:
+            print(f"UI Launch Error: {e}")
+
+    def update_status(self, text, state="idle"):
+        """Send status text to HTML (idle, listening, processing, speaking)"""
+        if self.running:
             try:
-                with open(self.memory_file, 'r') as f: return json.load(f)
-            except: pass
-        return {"user_profile": {}, "conversation_history": []}
-    def save_memory(self):
-        with open(self.memory_file, 'w') as f: json.dump(self.data, f, indent=2)
-    def add_conversation(self, user_msg, assistant_msg):
-        self.data["conversation_history"].append({
-            "timestamp": datetime.now().isoformat(),
-            "user": user_msg, "assistant": assistant_msg
-        })
-        self.data["conversation_history"] = self.data["conversation_history"][-20:]
-        self.save_memory()
-    def get_context(self):
-        context = []
-        if self.data["user_profile"]:
-            context.append(f"User Profile: {self.data['user_profile']}")
-        if self.data["conversation_history"]:
-            context.append("\nRecent conversations:")
-            for conv in self.data["conversation_history"][-3:]:
-                context.append(f"User: {conv['user']}\nAssistant: {conv['assistant']}")
-        return "\n".join(context)
+                safe_text = text.replace("'", "").replace('"', "")
+                self.driver.execute_script(
+                    f"window.setStatus('{safe_text}', '{state}')"
+                )
+            except:
+                self.running = False
 
-class SystemInfo:
-    @staticmethod
-    def get_time(): return datetime.now().strftime("%I:%M %p")
-    @staticmethod
-    def get_date(): return datetime.now().strftime("%A, %B %d, %Y")
-    @staticmethod
-    def get_battery():
-        try:
-            battery = psutil.sensors_battery()
-            return f"{battery.percent}%" if battery else "Unknown"
-        except: return "Unknown"
+    def update_amplitude(self, rms_value):
+        """Send audio volume to HTML to pulse the sphere"""
+        if self.running:
+            try:
+                # Normalize RMS (typically 0-30000) to 0.0-1.0
+                normalized = min(rms_value / 5000, 1.0)
+                self.driver.execute_script(
+                    f"window.setAmplitude({normalized})"
+                )
+            except:
+                pass
 
-# ------------------- GUI & MAIN -------------------
+    def quit(self):
+        if self.running:
+            self.driver.quit()
+            self.running = False
 
-class JarvisGUI(ctk.CTk):
-    def __init__(self, assistant_ref):
-        super().__init__()
-        self.assistant = assistant_ref
-        self.geometry("400x500")
-        self.title("Jarvis AI")
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-        self.attributes('-topmost', True)
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=1)
-        self.lbl_title = ctk.CTkLabel(self, text="J A R V I S", font=("Roboto Medium", 20))
-        self.lbl_title.grid(row=0, column=0, pady=(30, 10))
-        self.status_indicator = ctk.CTkButton(self, text="●", width=180, height=180, corner_radius=90, fg_color="#2B2B2B", hover_color="#2B2B2B", font=("Arial", 80), state="disabled")
-        self.status_indicator.grid(row=1, column=0, pady=20)
-        self.status_label = ctk.CTkLabel(self, text="Initializing...", font=("Roboto", 16))
-        self.status_label.grid(row=2, column=0, pady=(10, 40))
-        self.after(1000, self.start_assistant)
 
-    def update_status(self, text, color):
-        try:
-            self.status_label.configure(text=text)
-            self.status_indicator.configure(fg_color=color)
-        except: pass
-
-    def start_assistant(self):
-        self.update_status("Waiting...", "#2CC985") 
-        thread = threading.Thread(target=self.assistant.run_with_gui, args=(self,), daemon=True)
-        thread.start()
+# ------------------- CORE ASSISTANT -------------------
 
 class VoiceAssistant:
-    def __init__(self, groq_api_key: str, porcupine_access_key: str, 
-                 keyword_path: Optional[str] = None, audio_device_index: Optional[int] = None):
-        self.groq_client = Groq(api_key=groq_api_key)
-        self.memory = UserMemory()
-        self.system_info = SystemInfo()
-        self.media = MediaController()
-        self.local_music = LocalMusicPlayer()
-        self.audio_device_index = audio_device_index
-        self.porcupine = None
-        self.pa = None
-        self.audio_stream = None
-        try:
-            if keyword_path and os.path.exists(keyword_path):
-                self.porcupine = pvporcupine.create(access_key=porcupine_access_key, keyword_paths=[keyword_path])
-            else:
-                self.porcupine = pvporcupine.create(access_key=porcupine_access_key, keywords=["jarvis"])
-            self.pa = pyaudio.PyAudio()
-            self.audio_stream = self.pa.open(rate=self.porcupine.sample_rate, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=self.porcupine.frame_length, input_device_index=audio_device_index)
-        except: pass
-        self.recognizer = sr.Recognizer()
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 175)
-        self.running = False
-        self.tts_queue = queue.Queue()
-        self.gui_ref = None
-
-    def speak(self, text: str):
-        print(f"Assistant: {text}")
-        if self.gui_ref: self.gui_ref.update_status(f"Speaking...", "#9b59b6")
-        self.tts_queue.put(text)
-    
-    def tts_worker(self):
-        while self.running:
-            try:
-                text = self.tts_queue.get(timeout=1)
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-                if self.gui_ref: self.gui_ref.update_status("Waiting...", "#2CC985")
-            except: continue
-
-    def listen_for_command(self) -> Optional[str]:
-        if self.gui_ref: self.gui_ref.update_status("Listening...", "#e74c3c")
-        if not self.audio_stream: return None
-        with sr.Microphone(device_index=self.audio_device_index) as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            try:
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
-                if self.gui_ref: self.gui_ref.update_status("Processing...", "#3498db")
-                command = self.recognizer.recognize_google(audio)
-                print(f"User: {command}")
-                return command
-            except: return None
-
-    def get_ai_response(self, user_input: str) -> str:
-        sys_prompt = f"Time: {self.system_info.get_time()} Date: {self.system_info.get_date()} Battery: {self.system_info.get_battery()} {self.memory.get_context()} You are Jarvis. Helpful, concise, friendly."
-        try:
-            response = self.groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_input}], max_tokens=300)
-            return response.choices[0].message.content
-        except Exception as e: return f"Error: {e}"
-
-    def process_command(self, command: str):
-        cmd_lower = command.lower()
+    def __init__(self, groq_key, ppn_key):
+        self.groq = Groq(api_key=groq_key)
+        self.porcupine = pvporcupine.create(access_key=ppn_key, keywords=["jarvis"])
+        self.pa = pyaudio.PyAudio()
+        self.stream = self.pa.open(rate=self.porcupine.sample_rate, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=self.porcupine.frame_length)
+        self.rec = sr.Recognizer()
+        self.tts = pyttsx3.init()
+        self.tts.setProperty('rate', 175)
         
-        # --- 1. MUSIC CONTROLS (Prioritized) ---
-        if "pause" in cmd_lower:
-            self.speak(self.local_music.pause())
-            return
-        if "resume" in cmd_lower or "continue" in cmd_lower:
-            self.speak(self.local_music.resume())
-            return
-        if "stop music" in cmd_lower or "stop playing" in cmd_lower:
-            self.speak(self.local_music.stop())
-            return
+        self.launcher = UniversalLauncher()
+        self.player = MusicPlayer()
+        
+        # Start the 3D UI
+        self.ui = WebInterface()
+        
+        self.running = True
 
-        # --- 2. PLAY / SEARCH MEDIA ---
-        # Now accepts 'search' and 'find' as well as 'play'
-        play_match = re.match(r"^(play|search|find) (the )?(?P<query>.+?)(?: (?:on|in) (?P<service>youtube|spotify|yt))?$", cmd_lower)
-        if play_match:
-            query = play_match.group("query").strip()
-            service = (play_match.group("service") or "").strip()
-            
-            # If user explicitly says "search ... on youtube", we force online search
-            if "search" in cmd_lower or "find" in cmd_lower or service:
-                if not service: service = "youtube" # Default to YouTube if just "Search X"
-                self.speak(f"Searching for {query} on {service}")
-                self.media.play_online(query, service)
-                return
-            
-            # If user says "play X", we check local first
-            found_local, msg = self.local_music.find_and_play(query)
-            if found_local:
-                self.speak(msg)
-            else:
-                self.speak(f"Searching online for {query}")
-                self.media.play_online(query, "youtube")
-            return
+    def speak(self, text):
+        print(f"AI: {text}")
+        self.ui.update_status(text, "speaking")
+        
+        # Fake pulse animation during TTS (since we can't easily read TTS audio stream)
+        # We just pulse randomly to simulate talking
+        stop_pulse = False
+        def pulse_anim():
+            while not stop_pulse:
+                self.ui.update_amplitude(random.randint(1000, 4000))
+                time.sleep(0.1)
+            self.ui.update_amplitude(0)
 
-        # --- 3. OPEN APPS ---
-        app_match = re.match(r"^(open|start|launch) (the )?(?P<app>.+)$", cmd_lower)
-        if app_match:
-            app_name = app_match.group("app").strip()
-            success, msg = self.media.open_app(app_name)
+        t = threading.Thread(target=pulse_anim)
+        t.start()
+        
+        self.tts.say(text)
+        self.tts.runAndWait()
+        
+        stop_pulse = True
+        t.join()
+        self.ui.update_status("Waiting...", "idle")
+
+    def process(self, cmd):
+        cmd = cmd.lower()
+        self.ui.update_status("Processing...", "processing")
+        
+        if "open" in cmd:
+            app = cmd.replace("open", "").strip()
+            ok, msg = self.launcher.open(app)
             self.speak(msg)
-            return
-
-        # --- 4. SYSTEM / AI ---
-        if "time" in cmd_lower: self.speak(f"It's {self.system_info.get_time()}")
-        elif "date" in cmd_lower: self.speak(f"Today is {self.system_info.get_date()}")
-        elif "exit" in cmd_lower or "quit" in cmd_lower or "stop" == cmd_lower: # Strict "stop" check
-            self.speak("Goodbye!")
-            if self.gui_ref: self.gui_ref.quit()
+        elif "play" in cmd and ("youtube" in cmd or "online" in cmd):
+            q = cmd.replace("play", "").replace("on youtube", "").strip()
+            self.launcher.open_url(f"https://www.youtube.com/results?search_query={urllib.parse.quote(q)}")
+            self.speak(f"Opened YouTube for {q}")
+        elif "play" in cmd:
+            q = cmd.replace("play", "").strip()
+            msg = self.player.play(q)
+            if msg: self.speak(msg)
+            else: self.speak("Song not found.")
+        elif "stop" in cmd or "exit" in cmd:
+            self.speak("Goodbye.")
             self.running = False
         else:
-            response = self.get_ai_response(command)
-            self.speak(response)
-            self.memory.add_conversation(command, response)
+            # AI Response
+            try:
+                resp = self.groq.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role":"user","content":cmd}],
+                    max_tokens=100
+                ).choices[0].message.content
+                self.speak(resp)
+            except Exception as e: self.speak("I had an error.")
 
-    def run_with_gui(self, gui_app):
-        self.gui_ref = gui_app
-        self.running = True
-        threading.Thread(target=self.tts_worker, daemon=True).start()
-        self.speak("Systems online.")
-        if not self.audio_stream:
-            self.speak("Microphone unavailable. Please restart in Text Mode.")
-            return
+    def run(self):
+        self.speak("System Online.")
         try:
             while self.running:
-                pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
-                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
-                keyword_index = self.porcupine.process(pcm)
-                if keyword_index >= 0:
-                    self.speak("Yes?")
-                    command = self.listen_for_command()
-                    if command: self.process_command(command)
-                    else:
-                        if self.gui_ref: self.gui_ref.update_status("Waiting...", "#2CC985")
-        except KeyboardInterrupt: pass
-        finally: self.cleanup()
+                pcm = self.stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                
+                # 1. Calculate Volume for UI
+                rms = audioop.rms(pcm, 2)
+                self.ui.update_amplitude(rms) # Pulse the UI based on ambient noise
+                
+                # 2. Wake Word
+                pcm_unpacked = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
+                idx = self.porcupine.process(pcm_unpacked)
+                
+                if idx >= 0:
+                    self.ui.update_status("Listening...", "listening")
+                    # Play wake sound?
+                    
+                    # 3. Listen for Command
+                    # We close the PyAudio stream momentarily to let SpeechRecognition take over
+                    self.stream.close()
+                    try:
+                        with sr.Microphone() as source:
+                            self.rec.adjust_for_ambient_noise(source, duration=0.5)
+                            audio = self.rec.listen(source, timeout=5)
+                            text = self.rec.recognize_google(audio)
+                            self.process(text)
+                    except:
+                        self.ui.update_status("Didn't catch that.", "idle")
+                    
+                    # Reopen stream for Wake Word
+                    self.stream = self.pa.open(rate=self.porcupine.sample_rate, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=self.porcupine.frame_length)
 
-    def run_text_mode(self):
-        self.running = True
-        threading.Thread(target=self.tts_worker, daemon=True).start()
-        print("\n" + "="*50 + "\n⌨️  TEXT TESTING MODE ACTIVATED\n" + "="*50 + "\n")
-        try:
-            while self.running:
-                command = input("You > ").strip()
-                if not command: continue
-                self.process_command(command)
-        except KeyboardInterrupt: print("\nStopping...")
-        finally: self.cleanup()
-
-    def cleanup(self):
-        if self.audio_stream: self.audio_stream.close()
-        if self.pa: self.pa.terminate()
-        if self.porcupine: self.porcupine.delete()
-        self.running = False
-
-def list_audio_devices():
-    pa = pyaudio.PyAudio()
-    print("AUDIO DEVICES:")
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info['maxInputChannels'] > 0: print(f"[{i}] {info['name']}")
-    pa.terminate()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.ui.quit()
+            self.stream.close()
+            self.porcupine.delete()
 
 def main():
-    print("="*50 + "\nJARVIS AI ASSISTANT\n" + "="*50)
     import dotenv
     dotenv.load_dotenv()
-    groq_key = os.environ.get("GROQ_API_KEY") or input("Groq API Key: ").strip()
-    ppn_key = os.environ.get("PORCUPINE_ACCESS_KEY") or input("Porcupine Key: ").strip()
+    g_key = os.environ.get("GROQ_API_KEY") or input("Groq Key: ")
+    p_key = os.environ.get("PORCUPINE_ACCESS_KEY") or input("Porcupine Key: ")
     
-    print("\nSelect Mode:\n1. Voice Mode\n2. Text Mode")
-    mode = input("\nChoice (1/2): ").strip()
-    
-    device_idx = None
-    if mode == '1':
-        list_audio_devices()
-        try:
-            idx = input("\nSelect audio device index (Enter for default): ")
-            if idx: device_idx = int(idx)
-        except: pass
-
-    try:
-        assistant = VoiceAssistant(groq_key, ppn_key, audio_device_index=device_idx)
-        if mode == '2': assistant.run_text_mode()
-        else:
-            app = JarvisGUI(assistant)
-            app.mainloop()
-    except Exception as e: print(f"Error: {e}")
+    bot = VoiceAssistant(g_key, p_key)
+    bot.run()
 
 if __name__ == "__main__":
     main()
